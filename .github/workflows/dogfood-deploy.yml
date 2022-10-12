@@ -26,7 +26,7 @@ env:
 
 permissions:
   id-token: write
-  contents: read    # This is required for actions/checkout@2541b1294d2704b0964813337f33b291d3f8596b
+  contents: read    # This is required for actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8
 
 
 defaults:
@@ -38,7 +38,7 @@ jobs:
     name: Deploy Fleet Dogfood Environment
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@2541b1294d2704b0964813337f33b291d3f8596b
+      - uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8
       - id: fail-on-main
         run: "false"
         if: ${{ github.ref == 'main' }}
