@@ -20,7 +20,7 @@ jobs:
           output: 'trivy-results.sarif'
           severity: 'CRITICAL'
           skip-dirs: 'website/,tools/,infrastructure/,test/,orbit/pkg/insecure/'
-          skip-files: './yarn.lock'
+          skip-files: './yarn.lock, library/yarn.lock'
           trivyignores: '.trivyignore'
           security-checks: 'vuln'
 
