@@ -46,7 +46,7 @@ jobs:
         with:
           role-to-assume: ${{env.AWS_IAM_ROLE}}
           aws-region: ${{ env.AWS_REGION }}
-      - uses: hashicorp/setup-terraform@v2
+      - uses: hashicorp/setup-terraform@v2.0.2
         with:
           terraform_version: 1.0.4
           terraform_wrapper: false
