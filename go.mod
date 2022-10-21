@@ -82,7 +82,7 @@ require (
 	github.com/spf13/viper v1.8.1
 	github.com/stretchr/testify v1.8.0
 	github.com/theupdateframework/go-tuf v0.5.0
-	github.com/throttled/throttled/v2 v2.8.0
+	github.com/throttled/throttled/v2 v2.9.1
 	github.com/tj/assert v0.0.3
 	github.com/ulikunitz/xz v0.5.10
 	github.com/urfave/cli/v2 v2.3.0
