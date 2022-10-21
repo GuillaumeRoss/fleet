@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fleetdm/fleet/v4/pkg/fleethttp"
 	"github.com/fleetdm/fleet/v4/server"
 	"github.com/fleetdm/fleet/v4/server/datastore/mysql"
 	"github.com/fleetdm/fleet/v4/server/fleet"
@@ -52,6 +53,39 @@ func TestIntegrations(t *testing.T) {
 	testingSuite := new(integrationTestSuite)
 	testingSuite.s = &testingSuite.Suite
 	suite.Run(t, testingSuite)
+}
+
+type slowReader struct{}
+
+func (s *slowReader) Read(p []byte) (n int, err error) {
+	time.Sleep(3 * time.Second)
+	return 0, nil
+}
+
+func (s *integrationTestSuite) TestSlowOsqueryHost() {
+	t := s.T()
+	_, server := RunServerForTestsWithDS(
+		t,
+		s.ds,
+		&TestServerOpts{
+			SkipCreateTestUsers: true,
+			//nolint:gosec // G112: server is just run for testing this explicit config.
+			HTTPServerConfig: &http.Server{ReadTimeout: 2 * time.Second},
+		},
+	)
+	defer func() {
+		server.Close()
+	}()
+
+	req, err := http.NewRequest("POST", server.URL+"/api/v1/osquery/distributed/write", &slowReader{})
+	require.NoError(t, err)
+
+	client := fleethttp.NewClient()
+
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+
+	assert.Equal(t, http.StatusRequestTimeout, resp.StatusCode)
 }
 
 func (s *integrationTestSuite) TestDoubleUserCreationErrors() {
@@ -1775,6 +1809,7 @@ func (s *integrationTestSuite) TestTeamPoliciesProprietary() {
 	require.NotNil(t, policiesResponse.Policies[0].Resolution)
 	assert.Equal(t, "some team resolution updated", *policiesResponse.Policies[0].Resolution)
 	assert.Equal(t, "darwin", policiesResponse.Policies[0].Platform)
+	require.Len(t, policiesResponse.InheritedPolicies, 0)
 
 	listHostsURL := fmt.Sprintf("/api/latest/fleet/hosts?policy_id=%d", policiesResponse.Policies[0].ID)
 	listHostsResp := listHostsResponse{}
@@ -2400,7 +2435,7 @@ func (s *integrationTestSuite) TestHostDeviceMapping() {
 	// list hosts response includes device mappings
 	s.DoJSON("GET", "/api/latest/fleet/hosts?device_mapping=true", nil, http.StatusOK, &listHosts)
 	require.Len(t, listHosts.Hosts, 3)
-	hostsByID := make(map[uint]HostResponse)
+	hostsByID := make(map[uint]fleet.HostResponse)
 	for _, h := range listHosts.Hosts {
 		hostsByID[h.ID] = h
 	}
@@ -2466,7 +2501,7 @@ func (s *integrationTestSuite) TestListHostsDeviceMappingSize() {
 	var listHosts listHostsResponse
 	s.DoJSON("GET", "/api/latest/fleet/hosts?device_mapping=true", nil, http.StatusOK, &listHosts)
 
-	hostsByID := make(map[uint]HostResponse)
+	hostsByID := make(map[uint]fleet.HostResponse)
 	for _, h := range listHosts.Hosts {
 		hostsByID[h.ID] = h
 	}
@@ -2824,9 +2859,26 @@ func (s *integrationTestSuite) TestLabels() {
 	s.DoJSON("GET", fmt.Sprintf("/api/latest/fleet/labels/%d/hosts", lbl2.ID), nil, http.StatusOK, &listHostsResp)
 	assert.Len(t, listHostsResp.Hosts, len(hosts))
 
+	// list hosts in label searching by display_name
+	s.DoJSON("GET", fmt.Sprintf("/api/latest/fleet/labels/%d/hosts", lbl2.ID), nil, http.StatusOK, &listHostsResp, "order_key", "display_name", "order_direction", "desc")
+	assert.Len(t, listHostsResp.Hosts, len(hosts))
+	// first in the list is the last one, as the names are ordered with the index
+	// of creation, and vice-versa
+	assert.Equal(t, hosts[len(hosts)-1].ID, listHostsResp.Hosts[0].ID)
+	assert.Equal(t, hosts[0].ID, listHostsResp.Hosts[len(hosts)-1].ID)
+
+	// count hosts in label order by display_name
+	var countResp countHostsResponse
+	s.DoJSON("GET", "/api/latest/fleet/hosts/count", nil, http.StatusOK, &countResp, "label_id", fmt.Sprint(lbl2.ID), "order_key", "display_name", "order_direction", "desc")
+	assert.Equal(t, len(hosts), countResp.Count)
+
 	// lists hosts in label without hosts
 	s.DoJSON("GET", fmt.Sprintf("/api/latest/fleet/labels/%d/hosts", lbl1.ID), nil, http.StatusOK, &listHostsResp)
 	assert.Len(t, listHostsResp.Hosts, 0)
+
+	// count hosts in label
+	s.DoJSON("GET", "/api/latest/fleet/hosts/count", nil, http.StatusOK, &countResp, "label_id", fmt.Sprint(lbl1.ID))
+	assert.Equal(t, 0, countResp.Count)
 
 	// lists hosts in invalid label
 	s.DoJSON("GET", fmt.Sprintf("/api/latest/fleet/labels/%d/hosts", lbl2.ID+1), nil, http.StatusOK, &listHostsResp)
@@ -4983,6 +5035,63 @@ func (s *integrationTestSuite) TestEnrollHost() {
 	require.NotEmpty(t, resp.NodeKey)
 }
 
+func (s *integrationTestSuite) TestReenrollHostCleansPolicies() {
+	t := s.T()
+	ctx := context.Background()
+	host := s.createHosts(t)[0]
+
+	// set the enroll secret
+	var applyResp applyEnrollSecretSpecResponse
+	s.DoJSON("POST", "/api/latest/fleet/spec/enroll_secret", applyEnrollSecretSpecRequest{
+		Spec: &fleet.EnrollSecretSpec{
+			Secrets: []*fleet.EnrollSecret{{Secret: t.Name()}},
+		},
+	}, http.StatusOK, &applyResp)
+
+	var getHostResp getHostResponse
+	s.DoJSON("GET", fmt.Sprintf("/api/latest/fleet/hosts/%d", host.ID), nil, http.StatusOK, &getHostResp)
+	require.Empty(t, getHostResp.Host.Policies)
+
+	// create a policy and make the host fail it
+	pol, err := s.ds.NewGlobalPolicy(ctx, nil, fleet.PolicyPayload{Name: t.Name(), Query: "SELECT 1", Platform: host.FleetPlatform()})
+	require.NoError(t, err)
+	err = s.ds.RecordPolicyQueryExecutions(ctx, &fleet.Host{ID: host.ID}, map[uint]*bool{pol.ID: ptr.Bool(false)}, time.Now(), false)
+	require.NoError(t, err)
+
+	// refetch the host details
+	s.DoJSON("GET", fmt.Sprintf("/api/latest/fleet/hosts/%d", host.ID), nil, http.StatusOK, &getHostResp)
+	require.Len(t, *getHostResp.Host.Policies, 1)
+
+	// re-enroll the host, but using a different platform
+	j, err := json.Marshal(&enrollAgentRequest{
+		EnrollSecret:   t.Name(),
+		HostIdentifier: host.OsqueryHostID,
+		HostDetails:    map[string](map[string]string){"os_version": map[string]string{"platform": "windows"}},
+	})
+	require.NoError(t, err)
+
+	// prevent the enroll cooldown from being applied
+	mysql.ExecAdhocSQL(t, s.ds, func(db sqlx.ExtContext) error {
+		_, err := db.ExecContext(
+			context.Background(),
+			"UPDATE hosts SET last_enrolled_at = DATE_SUB(NOW(), INTERVAL '1' HOUR) WHERE id = ?",
+			host.ID,
+		)
+		return err
+	})
+	var resp enrollAgentResponse
+	hres := s.DoRawNoAuth("POST", "/api/osquery/enroll", j, http.StatusOK)
+	defer hres.Body.Close()
+	require.NoError(t, json.NewDecoder(hres.Body).Decode(&resp))
+	require.NotEmpty(t, resp.NodeKey)
+
+	// refetch the host details
+	s.DoJSON("GET", fmt.Sprintf("/api/latest/fleet/hosts/%d", host.ID), nil, http.StatusOK, &getHostResp)
+
+	// policies should be gone
+	require.Empty(t, getHostResp.Host.Policies)
+}
+
 func (s *integrationTestSuite) TestCarve() {
 	t := s.T()
 	hosts := s.createHosts(t)
@@ -5404,7 +5513,7 @@ func (s *integrationTestSuite) TestHostsReportDownload() {
 	res.Body.Close()
 	require.NoError(t, err)
 	require.Len(t, rows, len(hosts)+1) // all hosts + header row
-	require.Len(t, rows[0], 44)        // total number of cols
+	require.Len(t, rows[0], 45)        // total number of cols
 	t.Log(rows[0])
 
 	const (
@@ -5434,8 +5543,10 @@ func (s *integrationTestSuite) TestHostsReportDownload() {
 	require.Contains(t, rows[0], "hostname") // first row contains headers
 	require.Contains(t, res.Header, "Content-Disposition")
 	require.Contains(t, res.Header, "Content-Type")
+	require.Contains(t, res.Header, "X-Content-Type-Options")
 	require.Contains(t, res.Header.Get("Content-Disposition"), "attachment;")
 	require.Contains(t, res.Header.Get("Content-Type"), "text/csv")
+	require.Contains(t, res.Header.Get("X-Content-Type-Options"), "nosniff")
 
 	// pagination does not apply to this endpoint, it returns the complete list of hosts
 	res = s.DoRaw("GET", "/api/latest/fleet/hosts/report", nil, http.StatusOK, "format", "csv", "page", "1", "per_page", "2", "columns", "hostname")
